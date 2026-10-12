@@ -1,138 +1,76 @@
--- =====================================================================
--- schema.sql : ClickHouse DDL for the Discourse (OpenAI Community) ETL
+-- ClickHouse schema for Discourse topic analytics
+-- Run these statements in order (e.g. clickhouse-client --multiquery < schema.sql)
+
+-- ---------------------------------------------------------------------------
+-- 1. Fact table: one row per topic per snapshot (append-only history)
 --
--- NOTE: statements are split on the semicolon character by etl.py
--- --init-schema, so do not put that character inside comments or strings.
--- =====================================================================
-
-CREATE DATABASE IF NOT EXISTS discourse;
-
-
--- 1. Snapshot (fact) table
-CREATE TABLE IF NOT EXISTS discourse.topics_snapshot
+-- Idempotency: ReplacingMergeTree keeps the row with the highest `ingested_at`
+-- for each ORDER BY key. The key is (snapshot_hour, topic_id), so re-running the
+-- ETL within the same hour converges to a single row per topic instead of
+-- piling up duplicates. Use FINAL (or the dim_topics view) when you need
+-- strictly de-duplicated reads before background merges have run.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS topic_snapshots
 (
-    snapshot_bucket     DateTime('UTC')            COMMENT 'Run time floored to the bucket size: the idempotency key',
-    snapshot_ts         DateTime64(3, 'UTC')       COMMENT 'Exact time the ETL run started',
-    ingested_at         DateTime64(3, 'UTC') DEFAULT now64(3) COMMENT 'Row insert time: ReplacingMergeTree version',
-    run_id              UUID                       COMMENT 'Links to etl_runs.run_id',
-
-    topic_id            UInt64,
-    slug                String,
-    title               String,
-    url                 String                     COMMENT 'https://community.openai.com/t/{slug}/{id}',
-    category_id         UInt32                     COMMENT '0 when missing',
-    tags                Array(String),
-
-    views               UInt32,
-    posts_count         UInt32,
-    reply_count         UInt32,
-    like_count          UInt32,
-    highest_post_number UInt32,
-
-    created_at          DateTime64(3, 'UTC'),
-    last_posted_at      Nullable(DateTime64(3, 'UTC')),
-    bumped_at           Nullable(DateTime64(3, 'UTC')),
-
-    pinned              UInt8,
-    closed              UInt8,
-    archived            UInt8,
-    visible             UInt8,
-    has_accepted_answer UInt8,
-
-    sources             Array(LowCardinality(String)),
-    in_latest           UInt8,
-    in_top              UInt8,
-    in_hot              UInt8,
-    rank_latest         UInt16                     COMMENT '1-based position in the list, 0 = absent',
-    rank_top            UInt16,
-    rank_hot            UInt16
+    snapshot_ts     DateTime('UTC')                    COMMENT 'Exact start time of the ETL run',
+    snapshot_hour   DateTime('UTC')                    COMMENT 'snapshot_ts truncated to the hour (idempotency bucket)',
+    topic_id        UInt64,
+    slug            String,
+    title           String,
+    url             String                             COMMENT 'https://community.openai.com/t/{slug}/{topic_id}',
+    views           UInt32,
+    posts_count     UInt32,
+    reply_count     UInt32,
+    like_count      UInt32,
+    category_id     UInt32                             COMMENT '0 when the topic has no category',
+    created_at      DateTime('UTC'),
+    last_posted_at  Nullable(DateTime('UTC')),
+    bumped_at       Nullable(DateTime('UTC')),
+    sources         Array(LowCardinality(String))      COMMENT 'Lists the topic appeared in this run: latest / top / hot',
+    ingested_at     DateTime('UTC') DEFAULT now()      COMMENT 'Row version used by ReplacingMergeTree'
 )
 ENGINE = ReplacingMergeTree(ingested_at)
-PARTITION BY toYYYYMM(snapshot_bucket)
-ORDER BY (topic_id, snapshot_bucket)
-SETTINGS non_replicated_deduplication_window = 1000;
+PARTITION BY toYYYYMM(snapshot_hour)
+ORDER BY (snapshot_hour, topic_id);
 
 
--- 2. Dimension: latest state per topic
-CREATE TABLE IF NOT EXISTS discourse.dim_topics
+-- ---------------------------------------------------------------------------
+-- 2. Optional category dimension (id -> readable name), loaded best-effort by etl.py
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dim_categories
 (
-    topic_id            UInt64,
-    slug                String,
-    title               String,
-    url                 String,
-    category_id         UInt32,
-    tags                Array(String),
-    views               UInt32,
-    posts_count         UInt32,
-    reply_count         UInt32,
-    like_count          UInt32,
-    highest_post_number UInt32,
-    created_at          DateTime64(3, 'UTC'),
-    last_posted_at      Nullable(DateTime64(3, 'UTC')),
-    bumped_at           Nullable(DateTime64(3, 'UTC')),
-    pinned              UInt8,
-    closed              UInt8,
-    archived            UInt8,
-    visible             UInt8,
-    has_accepted_answer UInt8,
-    last_sources        Array(LowCardinality(String)),
-    snapshot_ts         DateTime64(3, 'UTC')       COMMENT 'Snapshot this state came from: version column'
+    category_id  UInt32,
+    name         String,
+    slug         String,
+    ingested_at  DateTime('UTC') DEFAULT now()
 )
-ENGINE = ReplacingMergeTree(snapshot_ts)
-ORDER BY topic_id;
-
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS discourse.mv_dim_topics
-TO discourse.dim_topics
-AS
-SELECT
-    topic_id, slug, title, url, category_id, tags,
-    views, posts_count, reply_count, like_count, highest_post_number,
-    created_at, last_posted_at, bumped_at,
-    pinned, closed, archived, visible, has_accepted_answer,
-    sources AS last_sources,
-    snapshot_ts
-FROM discourse.topics_snapshot;
-
-
--- 3. Category lookup
-CREATE TABLE IF NOT EXISTS discourse.dim_categories
-(
-    category_id        UInt32,
-    name               String,
-    slug               String,
-    parent_category_id UInt32 DEFAULT 0,
-    color              String,
-    updated_at         DateTime64(3, 'UTC')
-)
-ENGINE = ReplacingMergeTree(updated_at)
+ENGINE = ReplacingMergeTree(ingested_at)
 ORDER BY category_id;
 
 
--- 4. ETL audit log
-CREATE TABLE IF NOT EXISTS discourse.etl_runs
-(
-    run_id          UUID,
-    started_at      DateTime64(3, 'UTC'),
-    finished_at     DateTime64(3, 'UTC'),
-    status          LowCardinality(String)         COMMENT 'success / partial / failed / dry_run',
-    snapshot_bucket DateTime('UTC'),
-    source_counts   Map(String, UInt32)            COMMENT 'raw topics fetched per endpoint',
-    rows_fetched    UInt32                         COMMENT 'before de-duplication',
-    rows_merged     UInt32                         COMMENT 'unique topics after merge',
-    rows_inserted   UInt32                         COMMENT 'net new rows in topics_snapshot (0 = idempotent re-run)',
-    error           String
-)
-ENGINE = MergeTree
-ORDER BY started_at;
-
-
--- 5. Views
-CREATE VIEW IF NOT EXISTS discourse.v_dim_topics AS
-SELECT * FROM discourse.dim_topics FINAL;
-
-CREATE VIEW IF NOT EXISTS discourse.v_snapshots AS
-SELECT * FROM discourse.topics_snapshot FINAL;
-
-CREATE VIEW IF NOT EXISTS discourse.v_dim_categories AS
-SELECT * FROM discourse.dim_categories FINAL;
+-- ---------------------------------------------------------------------------
+-- 3. Dimension view: latest known state per topic
+--    - scalar columns come from the most recent snapshot (argMax by snapshot_ts)
+--    - `sources` is the latest snapshot's lists; `all_sources` is every list the
+--      topic has ever appeared in
+-- ---------------------------------------------------------------------------
+CREATE VIEW IF NOT EXISTS dim_topics AS
+SELECT
+    topic_id,
+    argMax(slug,           snapshot_ts) AS slug,
+    argMax(title,          snapshot_ts) AS title,
+    argMax(url,            snapshot_ts) AS url,
+    argMax(views,          snapshot_ts) AS views,
+    argMax(posts_count,    snapshot_ts) AS posts_count,
+    argMax(reply_count,    snapshot_ts) AS reply_count,
+    argMax(like_count,     snapshot_ts) AS like_count,
+    argMax(category_id,    snapshot_ts) AS category_id,
+    argMax(created_at,     snapshot_ts) AS created_at,
+    argMax(last_posted_at, snapshot_ts) AS last_posted_at,
+    argMax(bumped_at,      snapshot_ts) AS bumped_at,
+    argMax(sources,        snapshot_ts) AS sources,
+    groupUniqArrayArray(sources)        AS all_sources,
+    min(snapshot_ts)                    AS first_seen_at,
+    max(snapshot_ts)                    AS last_seen_at
+FROM topic_snapshots
+GROUP BY topic_id;
