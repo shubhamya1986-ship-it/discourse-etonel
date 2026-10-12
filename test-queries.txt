@@ -1,0 +1,82 @@
+Run the first question (top 20 topics by views)
+SELECT
+    topic_id,
+    title,
+    url,
+    views,
+    posts_count,
+    like_count,
+    created_at
+FROM discourse.v_dim_topics
+ORDER BY views DESC, topic_id
+LIMIT 20
+
+2. Run the velocity query
+SELECT
+    topic_id,
+    title,
+    url,
+    posts_count,
+    views,
+    created_at,
+    round(dateDiff('second', created_at, now64(3)) / 86400, 2) AS age_days,
+    round(posts_count / greatest(dateDiff('second', created_at, now64(3)) / 86400.0, 1.0 / 24), 2) AS posts_per_day
+FROM discourse.v_dim_topics
+WHERE posts_count >= 5
+ORDER BY posts_per_day DESC
+LIMIT 20
+
+What it does: it divides each topic's number of posts by its age in days, so a young topic with lots of replies ranks high. Topics with fewer than 5 posts are skipped to avoid noise.
+
+3. Run the trending query
+SELECT
+    topic_id,
+    argMax(title, snapshot_ts)       AS latest_title,
+    argMax(url, snapshot_ts)         AS latest_url,
+    count()                          AS hot_snapshots,
+    min(snapshot_ts)                 AS first_hot_at,
+    max(snapshot_ts)                 AS last_hot_at,
+    minIf(rank_hot, rank_hot > 0)    AS best_hot_rank,
+    argMax(views, snapshot_ts)       AS latest_views,
+    argMax(posts_count, snapshot_ts) AS latest_posts
+FROM discourse.v_snapshots
+WHERE in_hot = 1
+  AND snapshot_ts >= now64(3) - INTERVAL 24 HOUR
+GROUP BY topic_id
+ORDER BY hot_snapshots DESC, best_hot_rank ASC
+
+What it does: it looks through the saved snapshots for topics flagged as hot in the last 24 hours. hot_snapshots is how many of your runs saw the topic as hot, and best_hot_rank is its best position (1 is the top).
+
+4. Run the category query
+SELECT
+    t.category_id                                                    AS cat_id,
+    coalesce(c.name, concat('Category #', toString(t.category_id)))  AS category_name,
+    count()                                                          AS topics,
+    sum(t.posts_count)                                               AS total_posts,
+    sum(t.views)                                                     AS total_views,
+    sum(t.like_count)                                                AS total_likes,
+    round(sum(t.posts_count) / count(), 1)                           AS avg_posts_per_topic,
+    round(sum(t.views) / count(), 1)                                 AS avg_views_per_topic,
+    round(100 * sum(t.posts_count) / sum(sum(t.posts_count)) OVER (), 2) AS pct_of_posts,
+    round(100 * sum(t.views) / sum(sum(t.views)) OVER (), 2)             AS pct_of_views
+FROM discourse.v_dim_topics AS t
+LEFT JOIN discourse.v_dim_categories AS c ON t.category_id = c.category_id
+GROUP BY t.category_id, c.name
+ORDER BY total_views DESC
+SETTINGS join_use_nulls = 1 
+
+What it does: it groups the 274 topics by category and adds up their posts, views and likes. It also shows each category's share of the total. Category names come from the dim_categories table that the ETL filled in.
+
+5. Run the creation-pattern query
+SELECT
+    toDayOfWeek(created_at)           AS day_of_week,
+    dateName('weekday', created_at)   AS weekday_name,
+    toHour(created_at)                AS hour_of_day,
+    count()                           AS topics_created
+FROM discourse.v_dim_topics
+GROUP BY day_of_week, weekday_name, hour_of_day
+ORDER BY day_of_week, hour_of_day
+
+What it does: it counts how many topics were created in each weekday and hour combination. day_of_week runs from 1 (Monday) to 7 (Sunday), and all times are in UTC. This is the data behind the heatmap chart in the notebook.
+
+Expect many rows, up to 168 (7 days x 24 hours), though some combinations will be missing if no topic was created then.
